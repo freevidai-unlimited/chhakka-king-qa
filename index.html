@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>CHHAKKA KING - Super Over Showdown</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { background:#071c14; display:flex; justify-content:center; align-items:center; min-height:100vh; font-family:Arial,Helvetica,sans-serif; overflow:hidden; }
+  #wrap { position:relative; width:min(100vw, 520px); aspect-ratio:9/16; max-height:100vh; }
+  canvas { width:100%; height:100%; display:block; background:#0e5c3f; border-radius:12px; touch-action:none; }
+</style>
+<script src="https://bridge.playgama.com/v2/stable/playgama-bridge.js"></script>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="540" height="960"></canvas></div>
+<script>
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const W = 540, H = 960;
+
+// ---- Audio (WebAudio, no assets) ----
+let AC = null;
+function beep(freq, dur, type) {
+  if (!audioOn || userMuted) return;
+  try {
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'square'; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.12, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime + dur);
+  } catch (e) {}
+}
+function cheer() { beep(523, .12); setTimeout(() => beep(659, .12), 90); setTimeout(() => beep(784, .22), 180); setTimeout(() => beep(1046, .25), 270); }
+function crack() { beep(900, .05); setTimeout(() => beep(480, .08), 40); }
+
+// ---- Playgama Bridge (required for partner/Playables submission) ----
+// All calls are guarded: without Bridge (standalone play) the game works
+// exactly the same, except the best score is session-only. Progress is saved
+// ONLY through Bridge storage (checklist requirement).
+let bridgeReady = false, audioOn = true, userMuted = false, gameLang = 'en', paused = false, gameReadySent = false;
+function bcall(fn) { try { if (typeof bridge !== 'undefined' && bridgeReady) fn(); } catch (e) {} }
+function saveBest() {
+  bcall(() => { try { const r = bridge.storage.set(['ck_best'], [best]); if (r && r.catch) r.catch(() => {}); } catch (e) {} });
+}
+function loadBest() {
+  bcall(() => {
+    try {
+      const p = bridge.storage.get(['ck_best']);
+      if (p && p.then) p.then(data => {
+        let v = null;
+        if (Array.isArray(data)) v = data[0];
+        else if (typeof data === 'number') v = data;
+        else if (data && typeof data === 'object' && typeof data.ck_best === 'number') v = data.ck_best;
+        if (typeof v === 'number' && v > best) best = v;
+      }).catch(() => {});
+    } catch (e) {}
+  });
+}
+function showInterstitial() {
+  bcall(() => { try { if (bridge.advertisement.isInterstitialSupported) bridge.advertisement.showInterstitial(); } catch (e) {} });
+}
+// Poll + retry: in some sandboxes the SDK script arrives late, or the first
+// initialize() attempt fails while the platform adapter loads. Never give up
+// silently — the QA check fails the build if Bridge never initializes.
+function initBridge(attempt) {
+  if (typeof bridge === 'undefined') {
+    if (attempt < 10) setTimeout(() => initBridge(attempt + 1), 300);
+    return;
+  }
+  try {
+    bridge.initialize().then(() => {
+      bridgeReady = true;
+      try { gameLang = (bridge.platform.language || 'en').toLowerCase().slice(0, 2); } catch (e) {}
+      try { audioOn = bridge.platform.isAudioEnabled !== false; } catch (e) {}
+      try {
+        bridge.platform.on(bridge.EVENT_NAME.PAUSE_STATE_CHANGED, isPaused => { paused = !!isPaused; });
+        bridge.platform.on(bridge.EVENT_NAME.AUDIO_STATE_CHANGED, isEnabled => { audioOn = !!isEnabled; });
+      } catch (e) {}
+      loadBest();
+      // BUGFIX: game_ready must be sent AFTER initialize resolves. The old
+      // code sent it on frame 1, when init usually had not resolved yet, and
+      // then never retried — so Playgama's check never saw the game start.
+      if (!gameReadySent) {
+        gameReadySent = true;
+        try {
+          const r = bridge.platform.sendMessage('game_ready');
+          if (r && r.catch) r.catch(() => {});
+        } catch (e) {}
+      }
+    }).catch(err => {
+      try { console.log('Bridge init failed, retrying:', err); } catch (e) {}
+      if (attempt < 5) setTimeout(() => initBridge(attempt + 1), 1000);
+    });
+  } catch (e) {
+    if (attempt < 5) setTimeout(() => initBridge(attempt + 1), 1000);
+  }
+}
+initBridge(0);
+
+// ---- Match setup: SUPER OVER chase ----
+const TARGET = 20, MAX_BALLS = 6, MAX_WKTS = 2;
+let state = 'menu'; // menu | bowl | fly | over
+let score = 0, balls = 0, wickets = 0, best = 0;
+let ballY = 280, ballSpeed = 7, slowBall = false, ballVX = 0, ballVY = 0, flyT = 0;
+let charging = false, power = 0, powerDir = 1;
+let batSwing = 0;
+let msg = '', msgT = 0, msgColor = '#ffd800';
+let comm = '', commT = 0;
+let streak = 0;
+let particles = [], trail = [], results = [], bails = [];
+let stumpFall = 0, t = 0, won = false;
+
+const BAT_X = W / 2 - 70, BAT_Y = 620;
+const BALL_X = W / 2;
+const STUMP_Y = 685;
+
+const COMM_HI = {
+  SIX: ['Kya shot hai!', 'Ye to stadium ke bahar!', 'Bhai, timing dekh!', 'Crowd pagal ho gaya!'],
+  FOUR: ['Gap me khela, chaar!', 'Class shot!', 'Placement perfect!'],
+  OUT: ['Pressure me wicket!', 'Bada jhatka!', 'Ab match phisal raha hai!'],
+  WIN: ['Jeet gaye! Super Over king!'],
+  LOSE: ['Itna close! Phir try karo!']
+};
+const COMM_EN = {
+  SIX: ['What a shot!', 'That is out of the stadium!', 'Look at that timing!', 'The crowd has gone wild!'],
+  FOUR: ['Through the gap, four!', 'Classy shot!', 'Placement perfect!'],
+  OUT: ['Wicket under pressure!', 'A big blow!', 'The match is slipping away!'],
+  WIN: ['You won! Super Over king!'],
+  LOSE: ['So close! Try again!']
+};
+function pickC(key) {
+  const a = (gameLang === 'hi' ? COMM_HI : COMM_EN)[key];
+  return a[Math.floor(Math.random() * a.length)];
+}
+
+function reset() {
+  score = 0; balls = 0; wickets = 0; results = []; streak = 0; won = false;
+  ballSpeed = 7; msg = ''; comm = ''; particles = []; trail = []; bails = []; stumpFall = 0;
+  charging = false; power = 0;
+  bcall(() => { try { bridge.platform.sendMessage('level_started'); } catch (e) {} });
+  nextBall();
+}
+function nextBall() {
+  ballY = 280; ballVX = 0; ballVY = 0; flyT = 0; batSwing = 0; stumpFall = 0; bails = [];
+  const base = 7 + balls * 0.5;
+  ballSpeed = base + (Math.random() * 2.2 - 0.7);
+  slowBall = ballSpeed <= base - 0.4;
+  state = 'bowl';
+}
+function burst(n, gold) {
+  const cols = gold ? ['#ffd800', '#fff7ae', '#fff'] : ['#ffd800', '#fff', '#ff5a3c', '#4cd964'];
+  for (let i = 0; i < n; i++)
+    particles.push({ x: BALL_X, y: 620, vx: (Math.random() - .5) * 15, vy: -Math.random() * 13 - 2, c: cols[i % cols.length], life: 55 });
+}
+function fireworks() {
+  for (let k = 0; k < 3; k++) {
+    const fx = 120 + k * 150, fy = 250 + Math.random() * 80;
+    for (let i = 0; i < 24; i++) {
+      const a = (Math.PI * 2 * i) / 24;
+      particles.push({ x: fx, y: fy, vx: Math.cos(a) * 6, vy: Math.sin(a) * 6, c: ['#ffd800', '#ff5a3c', '#4cd964', '#5ac8fa'][i % 4], life: 45 });
+    }
+  }
+}
+function addResult(r) { results.push(r); if (results.length > 6) results.shift(); }
+
+// Press = start charging power. Release = swing.
+function press(e) {
+  // Mute button (top-right corner) — checklist: sound needs a mute control.
+  if (e && e.clientX !== undefined) {
+    const r = cv.getBoundingClientRect();
+    const x = (e.clientX - r.left) * W / r.width;
+    const y = (e.clientY - r.top) * H / r.height;
+    if (x >= 494 && x <= 530 && y >= 8 && y <= 44) { userMuted = !userMuted; beep(600, .06); return; }
+  }
+  if (state === 'menu') { reset(); beep(440, .1); return; }
+  if (state === 'over') { state = 'menu'; return; }
+  if (state !== 'bowl') return;
+  if (charging) return; // ignore key-repeat while holding
+  charging = true; power = 0; powerDir = 1;
+}
+function release() {
+  if (!charging || state !== 'bowl') { charging = false; return; }
+  charging = false;
+  batSwing = 14;
+  beep(300, .06, 'sawtooth');
+  const y = ballY, p = power;
+  let runs = null, out = null, perfect = false;
+  if (y >= 618 && y <= 642) { runs = 6; perfect = p >= 90; }
+  else if (y >= 600 && y <= 650) runs = 6;
+  else if ((y >= 560 && y < 600) || (y > 650 && y < STUMP_Y)) runs = p >= 60 ? 4 : 2;
+  else if (y >= 500 && y < 560) runs = p >= 80 ? 2 : 1;
+  else if (y < 500) return; // whiff: swing, ball keeps coming, charge again
+  // full-power mistime = caught!
+  if (runs !== null && p >= 92 && !(y >= 600 && y <= 650)) { out = 'catch'; }
+  balls++;
+  if (out === 'catch') {
+    wickets++; streak = 0;
+    msg = 'CATCH OUT!'; msgColor = '#ff5a3c'; comm = pickC('OUT'); commT = 70;
+    beep(140, .35, 'sawtooth'); addResult('W');
+    state = 'fly'; flyT = 0; ballVX = 0; ballVY = -6;
+  } else {
+    score += runs;
+    crack();
+    if (runs === 6) {
+      streak++;
+      msg = perfect ? 'MONSTER 6!' : 'CHHAKKA!'; msgColor = '#ffd800';
+      comm = pickC('SIX'); commT = 70; cheer(); burst(perfect ? 70 : 40, perfect); fireworks();
+      ballVX = 9; ballVY = -17; addResult('6');
+    } else if (runs === 4) {
+      streak++;
+      msg = 'CHAU KA!'; msgColor = '#7CFC98'; comm = pickC('FOUR'); commT = 60;
+      beep(660, .15); ballVX = 13; ballVY = -3; addResult('4');
+    } else {
+      streak = 0;
+      msg = runs + ' RUN'; msgColor = '#fff'; comm = ''; beep(520, .1); ballVX = 7; ballVY = 3; addResult(String(runs));
+    }
+  }
+  msgT = 55; state = 'fly'; flyT = 0;
+}
+
+function bowled() {
+  balls++; wickets++; streak = 0;
+  msg = 'BOWLED!'; msgColor = '#ff5a3c'; comm = pickC('OUT'); commT = 70;
+  beep(140, .35, 'sawtooth'); addResult('W');
+  stumpFall = 1;
+  bails = [
+    { x: W / 2 + 31, y: STUMP_Y - 36, vx: -3, vy: -7 },
+    { x: W / 2 + 43, y: STUMP_Y - 36, vx: 3, vy: -8 }
+  ];
+  state = 'fly'; flyT = 0; ballVX = 0; ballVY = 0;
+}
+
+function endBallCheck() {
+  if (score >= TARGET) {
+    won = true; state = 'over'; cheer(); comm = pickC('WIN');
+    bcall(() => { try { bridge.platform.sendMessage('level_completed'); } catch (e) {} });
+  } else if (wickets >= MAX_WKTS || balls >= MAX_BALLS) {
+    won = false; state = 'over'; comm = pickC('LOSE');
+    bcall(() => { try { bridge.platform.sendMessage('level_failed'); } catch (e) {} });
+  } else nextBall();
+  if (state === 'over') {
+    if (score > best) { best = score; saveBest(); }
+    showInterstitial();
+  }
+}
+
+// ---- Figures ----
+function batAngleNow() {
+  if (batSwing <= 0) return -0.6;
+  const p = 1 - batSwing / 14;
+  return p < 0.4 ? -0.6 + p * 4.2 : 1.08 - (p - 0.4) * 2.8;
+}
+function figure(x, y, color, isBatsman) {
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.arc(x, y - 54, 20, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#222'; ctx.beginPath(); ctx.arc(x, y - 58, 21, Math.PI, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = color;
+  ctx.fillRect(x - 13, y - 32, 26, 52);
+  ctx.fillStyle = '#eee'; ctx.fillRect(x - 13, y + 20, 11, 30); ctx.fillRect(x + 2, y + 20, 11, 30);
+  if (isBatsman) {
+    ctx.save();
+    ctx.translate(x + 26, y - 12);
+    ctx.rotate(batAngleNow());
+    ctx.fillStyle = '#e8c88a';
+    ctx.beginPath(); ctx.roundRect(-6, -10, 12, 78, 5); ctx.fill();
+    ctx.fillStyle = '#333'; ctx.fillRect(-4, -18, 8, 12);
+    ctx.restore();
+  }
+}
+
+function draw() {
+  t++;
+  // night sky + grass
+  ctx.fillStyle = '#0a2e22'; ctx.fillRect(0, 0, W, 280);
+  ctx.fillStyle = '#0e5c3f'; ctx.fillRect(0, 280, W, H - 280);
+  for (let i = 0; i < 10; i++) { ctx.fillStyle = i % 2 ? '#0d5539' : '#0e5c3f'; ctx.fillRect(0, 280 + i * 70, W, 70); }
+  // floodlights
+  [[60, 60], [W - 60, 60]].forEach(pt => {
+    const g = ctx.createRadialGradient(pt[0], pt[1], 5, pt[0], pt[1], 150);
+    g.addColorStop(0, 'rgba(255,255,200,0.55)'); g.addColorStop(1, 'rgba(255,255,200,0)');
+    ctx.fillStyle = g; ctx.fillRect(pt[0] - 150, 0, 300, 200);
+  });
+  // crowd wave
+  for (let i = 0; i < 72; i++) {
+    const cx = 16 + (i * 47) % (W - 32), cy = 196 + Math.floor(i / 12) * 20 + Math.sin(t / 12 - i * 0.35) * 4;
+    ctx.fillStyle = ['#ff5a3c', '#ffd800', '#4cd964', '#5ac8fa', '#ff9f0a'][i % 5] + 'aa';
+    ctx.fillRect(cx, cy, 7, 7);
+  }
+  // mute button (top-right)
+  ctx.fillStyle = '#00000088';
+  ctx.beginPath(); ctx.roundRect(494, 8, 36, 36, 8); ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(502, 20, 6, 12);
+  ctx.beginPath(); ctx.moveTo(508, 16); ctx.lineTo(518, 10); ctx.lineTo(518, 36); ctx.lineTo(508, 30); ctx.closePath(); ctx.fill();
+  if (!userMuted) {
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(518, 23, 5, -0.9, 0.9); ctx.stroke();
+    ctx.beginPath(); ctx.arc(518, 23, 9, -0.9, 0.9); ctx.stroke();
+  } else {
+    ctx.strokeStyle = '#ff5a3c'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(519, 14); ctx.lineTo(529, 32); ctx.moveTo(529, 14); ctx.lineTo(519, 32); ctx.stroke();
+  }
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 50px Arial';
+  ctx.fillText('SUPER OVER', W / 2, 76);
+  ctx.fillStyle = '#ffd800'; ctx.font = 'bold 24px Arial';
+  ctx.fillText('CHHAKKA KING  •  TARGET ' + TARGET, W / 2, 112);
+  // scoreboard strip
+  ctx.fillStyle = '#00000088'; ctx.fillRect(20, 126, W - 40, 56);
+  const need = Math.max(TARGET - score, 0), left = MAX_BALLS - balls;
+  ctx.font = 'bold 26px Arial'; ctx.fillStyle = '#fff'; ctx.textAlign = 'left';
+  ctx.fillText('SCORE ' + score + '/' + wickets, 34, 162);
+  ctx.textAlign = 'center';
+  ctx.fillText(state === 'over' ? '' : 'NEED ' + need + ' OFF ' + left, W / 2, 162);
+  ctx.textAlign = 'right'; ctx.fillStyle = '#ffd800';
+  ctx.fillText('BEST ' + best, W - 34, 162);
+  ctx.textAlign = 'center';
+  // streak badge
+  if (streak >= 2) {
+    ctx.fillStyle = '#ff5a3c'; ctx.font = 'bold 24px Arial';
+    ctx.fillText('ON FIRE!  ' + streak + ' boundaries in a row', W / 2, 208);
+  }
+  // recent results chips
+  results.forEach((r, i) => {
+    const x = W / 2 - (results.length - 1) * 18 + i * 36;
+    ctx.fillStyle = r === 'W' ? '#e5484d' : (r === '6' ? '#ffd800' : '#fff');
+    ctx.beginPath(); ctx.arc(x, 248, 14, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = (r === '6' || r === 'W') ? (r === 'W' ? '#fff' : '#000') : '#000';
+    ctx.font = 'bold 18px Arial'; ctx.fillText(r, x, 254);
+  });
+
+  // pitch
+  ctx.fillStyle = '#d9b98a'; ctx.fillRect(W / 2 - 70, 280, 140, 470);
+  ctx.fillStyle = '#c8a878'; ctx.fillRect(W / 2 - 70, 280, 140, 8); ctx.fillRect(W / 2 - 70, 742, 140, 8);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(W / 2 - 70, 288, 140, 4); ctx.fillRect(W / 2 - 70, 738, 140, 4);
+  if (state === 'bowl') {
+    ctx.fillStyle = 'rgba(0,200,83,0.45)'; ctx.fillRect(W / 2 - 70, 600, 140, 50);
+    ctx.fillStyle = 'rgba(255,214,10,0.35)'; ctx.fillRect(W / 2 - 70, 560, 140, 40);
+    ctx.fillStyle = 'rgba(255,214,10,0.35)'; ctx.fillRect(W / 2 - 70, 650, 140, 35);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 20px Arial';
+    ctx.fillText('6', W / 2 + 95, 632);
+    if (slowBall) { ctx.fillStyle = '#ffd800'; ctx.font = 'bold 22px Arial'; ctx.fillText('SLOWER ONE!', W / 2, 330); }
+  }
+  // power meter (while charging)
+  if (charging) {
+    const mx = 60, mw = W - 120, my = 800;
+    ctx.fillStyle = '#000000aa'; ctx.fillRect(mx - 6, my - 6, mw + 12, 36);
+    ctx.fillStyle = '#333'; ctx.fillRect(mx, my, mw, 24);
+    ctx.fillStyle = power < 60 ? '#4cd964' : (power < 85 ? '#ffd800' : '#ff5a3c');
+    ctx.fillRect(mx, my, mw * power / 100, 24);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 22px Arial';
+    ctx.fillText('POWER ' + Math.round(power) + '%  —  chhodo to swing!', W / 2, my + 52);
+  }
+  // stumps
+  ctx.save();
+  ctx.translate(W / 2 + 40, STUMP_Y);
+  if (stumpFall > 0) ctx.rotate(-Math.min(stumpFall * 0.06, 1.0));
+  ctx.fillStyle = '#ffd800';
+  ctx.fillRect(-12, -34, 6, 34); ctx.fillRect(0, -34, 6, 34); ctx.fillRect(12, -34, 6, 34);
+  ctx.restore();
+  bails.forEach(b => { ctx.fillStyle = '#ffd800'; ctx.fillRect(b.x, b.y, 12, 4); });
+  figure(W / 2 + 40, 740, '#2f9e44', false);
+  figure(W / 2, 300, '#e5484d', false);
+  figure(BAT_X, BAT_Y, '#1a56db', true);
+  // ball
+  if (state === 'bowl') {
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.beginPath(); ctx.ellipse(BALL_X, ballY + 16, 12, 4, 0, 0, Math.PI * 2); ctx.fill();
+    trail.forEach((ty, i) => {
+      ctx.fillStyle = 'rgba(255,255,255,' + (0.3 * (i + 1) / trail.length) + ')';
+      ctx.beginPath(); ctx.arc(BALL_X, ty, 8, 0, Math.PI * 2); ctx.fill();
+    });
+  }
+  if (state === 'bowl' || state === 'fly') {
+    const bx = state === 'fly' ? BALL_X + ballVX * flyT : BALL_X;
+    const by = state === 'fly' ? ballY + ballVY * flyT + 0.35 * flyT * flyT : ballY;
+    ctx.fillStyle = '#ff3b30';
+    ctx.beginPath(); ctx.arc(bx, by, 13, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(bx, by, 13, 0.6, 2.2); ctx.stroke();
+  }
+  particles.forEach(p => { ctx.fillStyle = p.c; ctx.fillRect(p.x, p.y, 8, 8); });
+  if (msgT > 0) {
+    ctx.font = 'bold 68px Arial'; ctx.fillStyle = msgColor;
+    ctx.fillText(msg, W / 2, 440);
+  }
+  if (commT > 0) {
+    ctx.font = 'italic bold 26px Arial'; ctx.fillStyle = '#fff';
+    ctx.fillText('“' + comm + '”', W / 2, 492);
+  }
+  if (state === 'menu') {
+    ctx.fillStyle = '#000000aa'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#ffd800'; ctx.font = 'bold 58px Arial';
+    ctx.fillText('SUPER OVER', W / 2, 350);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 30px Arial';
+    ctx.fillText('6 balls. Target 20. 2 wickets.', W / 2, 410);
+    ctx.font = 'bold 26px Arial';
+    ctx.fillText('Dabake rakho = POWER charge!', W / 2, 470);
+    ctx.fillText('Chhodo = SWING! Sahi time = 6', W / 2, 510);
+    ctx.fillText('Full power + galat timing = CATCH OUT', W / 2, 550);
+    ctx.fillStyle = '#ffd800'; ctx.font = 'bold 36px Arial';
+    ctx.fillText('TAP TO PLAY', W / 2, 640);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 24px Arial';
+    ctx.fillText('Best chase: ' + best, W / 2, 690);
+  }
+  if (state === 'over') {
+    ctx.fillStyle = '#000000aa'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = won ? '#ffd800' : '#fff'; ctx.font = 'bold 58px Arial';
+    ctx.fillText(won ? 'JEET GAYE!' : 'HAAR GAYE!', W / 2, 390);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 34px Arial';
+    ctx.fillText('Score: ' + score + '/' + wickets + '  (Target ' + TARGET + ')', W / 2, 460);
+    ctx.font = 'bold 26px Arial';
+    ctx.fillText('Best chase: ' + best, W / 2, 510);
+    ctx.fillStyle = '#ffd800'; ctx.font = 'bold 32px Arial';
+    ctx.fillText('Challenge: kya tum 20 bana sakte ho?', W / 2, 570);
+    ctx.fillText('TAP FOR REMATCH', W / 2, 640);
+  }
+}
+
+function loop() {
+  if (!paused) {
+  if (state === 'bowl') {
+    ballY += ballSpeed;
+    trail.push(ballY); if (trail.length > 6) trail.shift();
+    if (charging) {
+      power += powerDir * 2.2;
+      if (power >= 100) { power = 100; powerDir = -1; }
+      if (power <= 0) { power = 0; powerDir = 1; }
+    }
+    if (ballY >= STUMP_Y) { trail = []; charging = false; bowled(); }
+  }
+  if (state === 'fly') {
+    flyT++;
+    if (stumpFall > 0 && stumpFall < 20) stumpFall++;
+    bails.forEach(b => { b.x += b.vx; b.y += b.vy; b.vy += .6; });
+    if (flyT > 42) { flyT = 0; trail = []; endBallCheck(); }
+  }
+  if (batSwing > 0) batSwing--;
+  if (msgT > 0) msgT--;
+  if (commT > 0) commT--;
+  particles.forEach(p => { p.x += p.vx; p.y += p.vy; p.vy += .5; p.life--; });
+  particles = particles.filter(p => p.life > 0);
+  }
+  if (!gameReadySent && bridgeReady) { gameReadySent = true; bcall(() => { try { bridge.platform.sendMessage('game_ready'); } catch (e) {} }); }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+cv.addEventListener('pointerdown', e => { e.preventDefault(); press(e); });
+cv.addEventListener('pointerup', e => { e.preventDefault(); release(); });
+cv.addEventListener('pointercancel', () => { charging = false; });
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); press(); }
+  if (e.code === 'KeyM') { userMuted = !userMuted; }
+});
+window.addEventListener('keyup', e => {
+  if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); release(); }
+});
+loop();
+</script>
+</body>
+</html>
