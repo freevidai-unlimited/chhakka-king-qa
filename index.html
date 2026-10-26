@@ -62,43 +62,32 @@ function loadBest() {
 function showInterstitial() {
   bcall(() => { try { if (bridge.advertisement.isInterstitialSupported) bridge.advertisement.showInterstitial(); } catch (e) {} });
 }
-// Poll + retry: in some sandboxes the SDK script arrives late, or the first
-// initialize() attempt fails while the platform adapter loads. Never give up
-// silently — the QA check fails the build if Bridge never initializes.
-function initBridge(attempt) {
-  if (typeof bridge === 'undefined') {
-    if (attempt < 10) setTimeout(() => initBridge(attempt + 1), 300);
-    return;
-  }
-  try {
-    bridge.initialize().then(() => {
-      bridgeReady = true;
-      try { gameLang = (bridge.platform.language || 'en').toLowerCase().slice(0, 2); } catch (e) {}
-      try { audioOn = bridge.platform.isAudioEnabled !== false; } catch (e) {}
+// Bridge initialization — DIRECT top-level call, exactly the documented
+// shape (no wrapper indirection): the console's build check must be able to
+// see bridge.initialize() called as soon as the game script runs.
+if (typeof bridge !== 'undefined') {
+  bridge.initialize().then(() => {
+    bridgeReady = true;
+    try { gameLang = (bridge.platform.language || 'en').toLowerCase().slice(0, 2); } catch (e) {}
+    try { audioOn = bridge.platform.isAudioEnabled !== false; } catch (e) {}
+    try {
+      bridge.platform.on(bridge.EVENT_NAME.PAUSE_STATE_CHANGED, isPaused => { paused = !!isPaused; });
+      bridge.platform.on(bridge.EVENT_NAME.AUDIO_STATE_CHANGED, isEnabled => { audioOn = !!isEnabled; });
+    } catch (e) {}
+    loadBest();
+    // game_ready is sent AFTER initialize resolves — sending it on frame 1
+    // (before init finished) meant the check never saw the game start.
+    if (!gameReadySent) {
+      gameReadySent = true;
       try {
-        bridge.platform.on(bridge.EVENT_NAME.PAUSE_STATE_CHANGED, isPaused => { paused = !!isPaused; });
-        bridge.platform.on(bridge.EVENT_NAME.AUDIO_STATE_CHANGED, isEnabled => { audioOn = !!isEnabled; });
+        const r = bridge.platform.sendMessage('game_ready');
+        if (r && r.catch) r.catch(() => {});
       } catch (e) {}
-      loadBest();
-      // BUGFIX: game_ready must be sent AFTER initialize resolves. The old
-      // code sent it on frame 1, when init usually had not resolved yet, and
-      // then never retried — so Playgama's check never saw the game start.
-      if (!gameReadySent) {
-        gameReadySent = true;
-        try {
-          const r = bridge.platform.sendMessage('game_ready');
-          if (r && r.catch) r.catch(() => {});
-        } catch (e) {}
-      }
-    }).catch(err => {
-      try { console.log('Bridge init failed, retrying:', err); } catch (e) {}
-      if (attempt < 5) setTimeout(() => initBridge(attempt + 1), 1000);
-    });
-  } catch (e) {
-    if (attempt < 5) setTimeout(() => initBridge(attempt + 1), 1000);
-  }
+    }
+  }).catch(err => {
+    try { console.log('Bridge init failed:', err); } catch (e) {}
+  });
 }
-initBridge(0);
 
 // ---- Match setup: SUPER OVER chase ----
 const TARGET = 20, MAX_BALLS = 6, MAX_WKTS = 2;
@@ -242,7 +231,11 @@ function endBallCheck() {
     bcall(() => { try { bridge.platform.sendMessage('level_failed'); } catch (e) {} });
   } else nextBall();
   if (state === 'over') {
-    if (score > best) { best = score; saveBest(); }
+    if (score > best) best = score;
+    // Save on EVERY completed match, not only on a new best — the QA check
+    // for "progress saved via bridge.storage" must observe a set call even
+    // when the player scores 0 (a 0-score game previously saved nothing).
+    saveBest();
     showInterstitial();
   }
 }
